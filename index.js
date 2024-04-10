@@ -5,7 +5,33 @@ const stringify = require('csv-stringify/lib/sync')
 
 const token = core.getInput('token', {required: true})
 const octokit = github.getOctokit(token)
+const { Octokit } = require("@octokit/core");
+const { throttling } = require("@octokit/plugin-throttling");
 
+const ThrottledOctokit = Octokit.plugin(throttling);
+
+const octokit = new ThrottledOctokit({
+  auth: token,
+  throttle: {
+    onRateLimit: (retryAfter, options) => {
+      octokit.log.warn(
+        `Request quota exhausted for request ${options.method} ${options.url}`
+      );
+
+      // Retry twice after hitting a rate limit error, then give up
+      if (options.request.retryCount === 5) {
+        console.log(`Retrying after ${retryAfter} seconds!`);
+        return true;
+      }
+    },
+    onAbuseLimit: (retryAfter, options) => {
+      // does not retry, only logs a warning
+      octokit.log.warn(
+        `Abuse detected for request ${options.method} ${options.url}`
+      );
+    },
+  },
+});
 const eventPayload = require(process.env.GITHUB_EVENT_PATH)
 const org = core.getInput('org', {required: false}) || eventPayload.organization.login
 
@@ -40,6 +66,19 @@ let fileDate
     })
 
     data.forEach((element) => {
+       // Check rate limit
+       const rateLimit = await octokit.rateLimit.get()
+       const remaining = rateLimit.data.rate.remaining
+ 
+       // If remaining requests are less than or equal to 100, pause execution
+       if (remaining <= 100) {
+         const resetTime = rateLimit.data.rate.reset * 1000 // Convert to milliseconds
+         const pauseDuration = resetTime - Date.now() // Calculate pause duration
+ 
+         // Pause execution
+         await new Promise(resolve => setTimeout(resolve, pauseDuration))
+       }
+
       if (re.test(fromdate, todate) !== true) {
         if (element['@timestamp'] >= intervalDays) {
           dataArray.push(element)
@@ -58,6 +97,10 @@ let fileDate
     })
 
     console.log(`Retrieve Git audit log for ${logDate}`)
+  } catch (error) {
+    console.error(error)
+  }
+})()
 
     // Sum and sort Git audit log data per organization member
     const gitSum = dataArray.reduce((res, {actor, action}) => {
@@ -85,51 +128,51 @@ let fileDate
 
       gitArray.push({memberName, gitClone, gitPush, gitFetch})
     })
-    await pushAuditReport(gitArray)
-  } catch (error) {
-    core.setFailed(error.message)
-  }
-})()
-
-async function pushAuditReport(gitArray) {
-  try {
-    // Set sorting settings and add header to array
-    const columns = {
-      memberName: 'Username',
-      gitClone: `Git clones (${columnDate})`,
-      gitPush: `Git pushes (${columnDate})`,
-      gitFetch: `Git fetches (${columnDate})`
-    }
-    const sortColumn = core.getInput('sort', {required: false}) || 'gitClone'
-    const sortArray = arraySort(gitArray, sortColumn, {reverse: true})
-    sortArray.unshift(columns)
-
-    // Convert array to csv
-    const csv = stringify(sortArray)
-
-    // Prepare path/filename, repo/org context and commit name/email variables
-    const reportPath = `reports/${org}-${new Date().toISOString().substring(0, 19) + 'Z'}-${fileDate}.csv`
-    const committerName = core.getInput('committer-name', {required: false}) || 'github-actions'
-    const committerEmail = core.getInput('committer-email', {required: false}) || 'github-actions@github.com'
-    const {owner, repo} = github.context.repo
-
-    // Push csv to repo
-    const opts = {
-      owner,
-      repo,
-      path: reportPath,
-      message: `${new Date().toISOString().slice(0, 10)} Git audit log report`,
-      content: Buffer.from(csv).toString('base64'),
-      committer: {
-        name: committerName,
-        email: committerEmail
+      try {
+        await pushAuditReport(gitArray);
+      } catch (error) {
+        core.setFailed(error.message);
       }
-    }
 
-    console.log(`Pushing final CSV report to repository path: ${reportPath}`)
+      async function pushAuditReport(gitArray) {
+        try {
+          // Set sorting settings and add header to array
+          const columns = {
+            memberName: 'Username',
+            gitClone: `Git clones (${columnDate})`,
+            gitPush: `Git pushes (${columnDate})`,
+            gitFetch: `Git fetches (${columnDate})`
+          };
+          const sortColumn = core.getInput('sort', {required: false}) || 'gitClone';
+          const sortArray = arraySort(gitArray, sortColumn, {reverse: true});
+          sortArray.unshift(columns);
 
-    await octokit.rest.repos.createOrUpdateFileContents(opts)
-  } catch (error) {
-    core.setFailed(error.message)
-  }
-}
+          // Convert array to csv
+          const csv = stringify(sortArray);
+
+          // Prepare path/filename, repo/org context and commit name/email variables
+          const reportPath = `reports/${org}-${new Date().toISOString().substring(0, 19) + 'Z'}-${fileDate}.csv`;
+          const committerName = core.getInput('committer-name', {required: false}) || 'github-actions';
+          const committerEmail = core.getInput('committer-email', {required: false}) || 'github-actions@github.com';
+          const {owner, repo} = github.context.repo;
+
+          // Push csv to repo
+          const opts = {
+            owner,
+            repo,
+            path: reportPath,
+            message: `${new Date().toISOString().slice(0, 10)} Git audit log report`,
+            content: Buffer.from(csv).toString('base64'),
+            committer: {
+              name: committerName,
+              email: committerEmail
+            }
+          };
+
+          console.log(`Pushing final CSV report to repository path: ${reportPath}`);
+
+          await octokit.rest.repos.createOrUpdateFileContents(opts);
+        } catch (error) {
+          core.setFailed(error.message);
+        }
+      }
